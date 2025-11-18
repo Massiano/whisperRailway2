@@ -1,7 +1,19 @@
+# Force CPU-only PyTorch (critical for Railway)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.4.0+cpu
+torchvision==0.19.0+cpu  # optional, but avoids auto-GPU pull
+torchaudio==2.4.0+cpu
+
+# Core
 fastapi>=0.104.0
 uvicorn>=0.24.0
-transformers>=4.36.0
-torch>=2.0.0
-accelerate>=0.25.0
-librosa>=0.10.0
 python-multipart>=0.0.6
+
+# Whisper (Hugging Face)
+transformers>=4.36.0,<4.58  # pin to avoid latest 4.57.1 if unstable
+accelerate>=0.25.0
+huggingface-hub>=0.25.0
+
+# Audio loading (no system ffmpeg)
+librosa>=0.10.0
+soundfile>=0.12.0  # lighter than audioread
