@@ -4,6 +4,9 @@ import librosa
 import torch
 import os
 import tempfile
+from datetime import datetime
+import platform
+import transformers
 
 # ----------------------------
 # Initialize FastAPI App
@@ -15,18 +18,51 @@ app = FastAPI(
 )
 
 # ----------------------------
-# Load Whisper Model ONCE at startup
+# Load Whisper Model ONCE at startup (CPU-only for Railway)
 # ----------------------------
-print("Loading Whisper Tiny...")
-MODEL_NAME = "openai/whisper-tiny"  # ~180MB RAM, supports 99 languages
+print("🚀 Loading Whisper Tiny (CPU mode)...")
+MODEL_NAME = "openai/whisper-tiny"
 
-# Disable gradient computation for memory savings
+# Force CPU — Railway doesn't support GPU on standard instances
+device = "cpu"
+print(f"Using device: {device}")
+
+# Disable gradients and set float32 (saves RAM vs float64)
 torch.set_grad_enabled(False)
+torch.set_default_dtype(torch.float32)
 
 processor = WhisperProcessor.from_pretrained(MODEL_NAME)
-model = WhisperForConditionalGeneration.from_pretrained(MODEL_NAME)
-model.eval()  # Set to inference mode
-print("Model loaded ✅")
+model = WhisperForConditionalGeneration.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float32  # Explicitly use float32
+)
+model.eval()
+model.to(device)
+
+print("✅ Model loaded on CPU")
+
+
+# ----------------------------
+# Root Diagnostic Endpoint
+# ----------------------------
+@app.get("/")
+async def root():
+    return {
+        "status": "✅ OK",
+        "app": "Whisper Quiz Transcriber",
+        "version": "1.0",
+        "model_loaded": MODEL_NAME,
+        "device": device,
+        "torch_version": torch.__version__,
+        "transformers_version": transformers.__version__,
+        "python_version": platform.python_version(),
+        "server_time_utc": datetime.utcnow().isoformat() + "Z",
+        "endpoints": {
+            "transcribe": "/transcribe/ (POST, multipart/form-data with audio file)"
+        },
+        "ready": True
+    }
+
 
 # ----------------------------
 # Transcribe Endpoint
@@ -34,42 +70,33 @@ print("Model loaded ✅")
 @app.post("/transcribe/")
 async def transcribe(
     audio: UploadFile = File(...),
-    language: str = "en"  # Optional: force language (e.g., "es", "fr", "de")
+    language: str = "en"  # "auto" or ISO code like "es", "fr"
 ):
-    """
-    Accepts a short audio file (WAV, MP3, etc.), returns transcription.
-    """
     if not audio.filename:
         raise HTTPException(status_code=400, detail="No file provided")
 
-    # Use secure temporary file
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(audio.filename)[1]) as tmp:
         tmp.write(await audio.read())
         tmp_path = tmp.name
 
     try:
-        # Load audio at 16kHz mono
-        audio_array, _ = librosa.load(tmp_path, sr=16000)
+        # Load audio at 16kHz mono (reduce memory by not loading extra channels)
+        audio_array, _ = librosa.load(tmp_path, sr=16000, mono=True)
 
-        # Process for Whisper
-        input_features = processor(
+        # Process
+        inputs = processor(
             audio_array,
             sampling_rate=16000,
             return_tensors="pt"
-        ).input_features
-
-        # Force language if provided (improves accuracy)
-        forced_decoder_ids = None
-        if language != "auto":
-            forced_decoder_ids = processor.get_decoder_prompt_ids(language=language, task="transcribe")
-
-        # Generate transcription
-        generated_ids = model.generate(
-            input_features,
-            forced_decoder_ids=forced_decoder_ids,
-            max_new_tokens=128  # Prevent long outputs
         )
+        input_features = inputs.input_features.to(device)
 
+        generate_kwargs = {"max_new_tokens": 128}
+        if language != "auto":
+            generate_kwargs["language"] = language
+            generate_kwargs["task"] = "transcribe"
+
+        generated_ids = model.generate(input_features, **generate_kwargs)
         transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
         return {
@@ -79,8 +106,11 @@ async def transcribe(
         }
 
     except Exception as e:
+        print(f"⚠️ Transcription error: {e}")
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
     finally:
-        # Clean up temp file
         if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+            try:
+                os.unlink(tmp_path)
+            except Exception as e:
+                print(f"⚠️ Failed to delete temp file: {e}")
